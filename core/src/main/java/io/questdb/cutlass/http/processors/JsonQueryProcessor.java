@@ -71,6 +71,7 @@ import io.questdb.std.NumericException;
 import io.questdb.std.ObjList;
 import io.questdb.std.str.DirectUtf8Sequence;
 import io.questdb.std.str.Path;
+import io.questdb.std.str.Utf8String;
 
 import java.io.Closeable;
 
@@ -818,12 +819,164 @@ public class JsonQueryProcessor implements HttpRequestProcessor, HttpRequestHand
 
         try {
             state.configure(header, query, skip, stop);
+            parseBindVariableParameters(header, sqlExecutionContext);
         } catch (Utf8Exception e) {
             state.info().$("Bad UTF8 encoding").$();
             sendBadUtf8EncodingInRequestResponse(context.getChunkedResponse(), context, query, keepAliveHeader);
             return false;
+        } catch (SqlException e) {
+            sqlError(context.getChunkedResponse(), state, e, keepAliveHeader);
+            readyForNextRequest(context);
+            return false;
         }
         return true;
+    }
+
+    private void parseBindVariableParameters(
+            HttpRequestHeader header,
+            SqlExecutionContextImpl sqlExecutionContext
+    ) throws SqlException {
+        final BindVariableService bindVariableService = sqlExecutionContext.getBindVariableService();
+        if (bindVariableService == null) {
+            return;
+        }
+
+        // Clear any existing bind variables for this request
+        bindVariableService.clear();
+        
+        // Check for bind variable parameters by looking for specific parameter patterns
+        // We'll check for common bind variable names and positional parameters
+        parseNamedBindVariables(header, bindVariableService);
+        parsePositionalBindVariables(header, bindVariableService);
+    }
+    
+    private void parseNamedBindVariables(HttpRequestHeader header, BindVariableService bindVariableService) throws SqlException {
+        // Check for common named bind variable patterns
+        // For now, we'll check for parameters that start with $ 
+        for (int i = 0; i < 100; i++) { // Check reasonable number of potential bind variables
+            String paramName = "$" + i; 
+            DirectUtf8Sequence paramValue = header.getUrlParam(new Utf8String(paramName));
+            if (paramValue != null) {
+                setNamedBindVariable(bindVariableService, paramName, paramValue.asAsciiCharSequence());
+            }
+        }
+        
+        // Also check for some common named parameter patterns
+        String[] commonParams = {"id", "name", "value", "price", "amount", "date", "status", "active", "enabled"};
+        for (String param : commonParams) {
+            String namedParam = "$" + param;
+            DirectUtf8Sequence paramValue = header.getUrlParam(new Utf8String(namedParam));
+            if (paramValue != null) {
+                setNamedBindVariable(bindVariableService, namedParam, paramValue.asAsciiCharSequence());
+            }
+        }
+    }
+    
+    private void parsePositionalBindVariables(HttpRequestHeader header, BindVariableService bindVariableService) throws SqlException {
+        // Check for positional bind variables (numeric indices)
+        for (int i = 0; i < 100; i++) { // Check reasonable number of potential bind variables
+            String paramName = Integer.toString(i);
+            DirectUtf8Sequence paramValue = header.getUrlParam(new Utf8String(paramName));
+            if (paramValue != null) {
+                setIndexedBindVariable(bindVariableService, i, paramValue.asAsciiCharSequence());
+            }
+        }
+    }
+    
+    private void setNamedBindVariable(BindVariableService bindVariableService, CharSequence paramName, CharSequence paramValue) throws SqlException {
+        // Infer type from parameter value and set bind variable
+        if (isNull(paramValue)) {
+            bindVariableService.setStr(paramName, null);
+        } else if (isBoolean(paramValue)) {
+            bindVariableService.setBoolean(paramName, parseBoolean(paramValue));
+        } else if (isInteger(paramValue)) {
+            try {
+                long longValue = Numbers.parseLong(paramValue);
+                if (longValue >= Integer.MIN_VALUE && longValue <= Integer.MAX_VALUE) {
+                    bindVariableService.setInt(paramName, (int) longValue);
+                } else {
+                    bindVariableService.setLong(paramName, longValue);
+                }
+            } catch (NumericException e) {
+                bindVariableService.setStr(paramName, paramValue);
+            }
+        } else if (isDouble(paramValue)) {
+            try {
+                double doubleValue = Numbers.parseDouble(paramValue);
+                bindVariableService.setDouble(paramName, doubleValue);
+            } catch (NumericException e) {
+                bindVariableService.setStr(paramName, paramValue);
+            }
+        } else {
+            // Default to string
+            bindVariableService.setStr(paramName, paramValue);
+        }
+    }
+    
+    private void setIndexedBindVariable(BindVariableService bindVariableService, int index, CharSequence paramValue) throws SqlException {
+        // Infer type from parameter value and set bind variable
+        if (isNull(paramValue)) {
+            bindVariableService.setStr(index, null);
+        } else if (isBoolean(paramValue)) {
+            bindVariableService.setBoolean(index, parseBoolean(paramValue));
+        } else if (isInteger(paramValue)) {
+            try {
+                long longValue = Numbers.parseLong(paramValue);
+                if (longValue >= Integer.MIN_VALUE && longValue <= Integer.MAX_VALUE) {
+                    bindVariableService.setInt(index, (int) longValue);
+                } else {
+                    bindVariableService.setLong(index, longValue);
+                }
+            } catch (NumericException e) {
+                bindVariableService.setStr(index, paramValue);
+            }
+        } else if (isDouble(paramValue)) {
+            try {
+                double doubleValue = Numbers.parseDouble(paramValue);
+                bindVariableService.setDouble(index, doubleValue);
+            } catch (NumericException e) {
+                bindVariableService.setStr(index, paramValue);
+            }
+        } else {
+            // Default to string
+            bindVariableService.setStr(index, paramValue);
+        }
+    }
+    
+    private boolean isNull(CharSequence value) {
+        return value == null || Chars.equalsIgnoreCase(value, "null");
+    }
+    
+    private boolean isBoolean(CharSequence value) {
+        return Chars.equalsIgnoreCase(value, "true") || Chars.equalsIgnoreCase(value, "false");
+    }
+    
+    private boolean parseBoolean(CharSequence value) {
+        return Chars.equalsIgnoreCase(value, "true");
+    }
+    
+    private boolean isInteger(CharSequence value) {
+        if (value == null || value.length() == 0) {
+            return false;
+        }
+        try {
+            Numbers.parseLong(value);
+            return !Chars.contains(value, '.');
+        } catch (NumericException e) {
+            return false;
+        }
+    }
+    
+    private boolean isDouble(CharSequence value) {
+        if (value == null || value.length() == 0) {
+            return false;
+        }
+        try {
+            Numbers.parseDouble(value);
+            return true;
+        } catch (NumericException e) {
+            return false;
+        }
     }
 
     private void retryQueryExecution(
